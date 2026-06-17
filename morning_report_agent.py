@@ -13,12 +13,14 @@ Before running:
 
     2. Configure mail settings:
        Windows PowerShell:
+           $env:MAIL_PROVIDER="gmail"
            $env:MAIL_USER="your_sender_email"
            $env:MAIL_PASSWORD="your_email_app_password"
            $env:REPORT_TARGET_EMAIL="your_default_recipient_email"
 
-    3. Fill in the SMTP settings in send_daily_report() if you are not using Gmail.
-       For Gmail, use an app password instead of your normal account password.
+    3. Use SMTP_HOST, SMTP_PORT, and SMTP_SECURITY to override provider defaults.
+       For Gmail, QQ, and NetEase, use an app password or authorization code
+       instead of your normal account password.
 """
 
 from __future__ import annotations
@@ -67,6 +69,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 load_dotenv()
+
+SMTP_PROVIDER_PRESETS: dict[str, dict[str, str | int]] = {
+    "gmail": {"host": "smtp.gmail.com", "port": 587, "security": "starttls"},
+    "qq": {"host": "smtp.qq.com", "port": 465, "security": "ssl"},
+    "netease": {"host": "smtp.163.com", "port": 465, "security": "ssl"},
+    "163": {"host": "smtp.163.com", "port": 465, "security": "ssl"},
+    "126": {"host": "smtp.126.com", "port": 465, "security": "ssl"},
+    "yeah": {"host": "smtp.yeah.net", "port": 465, "security": "ssl"},
+}
+
+
 class FetchHackerNewsArgs(BaseModel):
     """Arguments for fetch_hacker_news."""
 
@@ -230,6 +243,53 @@ def markdown_to_email_html(markdown_content: str) -> str:
     return "\n".join(html_parts)
 
 
+def get_smtp_config() -> dict[str, str | int]:
+    """
+    Resolve SMTP settings from a provider preset plus optional environment overrides.
+
+    Environment variables:
+      - MAIL_PROVIDER: gmail, qq, netease, 163, 126, yeah, custom
+      - SMTP_HOST: override SMTP server host
+      - SMTP_PORT: override SMTP server port
+      - SMTP_SECURITY: ssl, starttls, or none
+    """
+    provider = os.getenv("MAIL_PROVIDER", "gmail").strip().lower()
+    preset = SMTP_PROVIDER_PRESETS.get(provider)
+
+    if provider == "custom":
+        smtp_host = os.getenv("SMTP_HOST")
+        smtp_port = os.getenv("SMTP_PORT")
+        if not smtp_host or not smtp_port:
+            raise ValueError(
+                "MAIL_PROVIDER=custom requires SMTP_HOST and SMTP_PORT."
+            )
+        preset = {
+            "host": smtp_host,
+            "port": int(smtp_port),
+            "security": os.getenv("SMTP_SECURITY", "starttls"),
+        }
+    elif not preset:
+        supported = ", ".join(sorted(SMTP_PROVIDER_PRESETS))
+        raise ValueError(
+            "Unsupported MAIL_PROVIDER "
+            f"'{provider}'. Supported providers: {supported}, custom."
+        )
+
+    host = os.getenv("SMTP_HOST", str(preset["host"]))
+    port = int(os.getenv("SMTP_PORT", str(preset["port"])))
+    security = os.getenv("SMTP_SECURITY", str(preset["security"])).strip().lower()
+
+    if security not in {"ssl", "starttls", "none"}:
+        raise ValueError("SMTP_SECURITY must be one of: ssl, starttls, none.")
+
+    return {
+        "provider": provider,
+        "host": host,
+        "port": port,
+        "security": security,
+    }
+
+
 def send_daily_report(
     subject: str, markdown_content: str, target_email: str = ""
 ) -> str:
@@ -244,9 +304,15 @@ def send_daily_report(
         target_email=target_email,
     )
 
-    # TODO: Override these if your email provider is not Gmail.
-    smtp_host = os.getenv("SMTP_HOST", "smtp.qq.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    try:
+        smtp_config = get_smtp_config()
+    except ValueError as exc:
+        return f"Email was not sent because SMTP configuration is invalid: {exc}"
+
+    smtp_host = str(smtp_config["host"])
+    smtp_port = int(smtp_config["port"])
+    smtp_security = str(smtp_config["security"])
+    smtp_provider = str(smtp_config["provider"])
     smtp_username = os.getenv("MAIL_USER")
     smtp_password = os.getenv("MAIL_PASSWORD")
     sender_email = smtp_username
@@ -276,7 +342,7 @@ def send_daily_report(
     message.attach(html_part)
 
     try:
-        if smtp_port == 465:
+        if smtp_security == "ssl":
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
                 server.login(smtp_username, smtp_password)
                 server.sendmail(
@@ -284,19 +350,29 @@ def send_daily_report(
                 )
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
+                if smtp_security == "starttls":
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
                 server.login(smtp_username, smtp_password)
                 server.sendmail(
                     sender_email, [resolved_target_email], message.as_string()
                 )
     except smtplib.SMTPException as exc:
-        return f"Failed to send daily report email: {exc}"
+        return (
+            "Failed to send daily report email "
+            f"via {smtp_provider} ({smtp_host}:{smtp_port}, {smtp_security}): {exc}"
+        )
     except OSError as exc:
-        return f"Failed to connect to SMTP server: {exc}"
+        return (
+            "Failed to connect to SMTP server "
+            f"via {smtp_provider} ({smtp_host}:{smtp_port}, {smtp_security}): {exc}"
+        )
 
-    return f"Daily report sent successfully to {resolved_target_email}."
+    return (
+        f"Daily report sent successfully to {resolved_target_email} "
+        f"via {smtp_provider} ({smtp_host}:{smtp_port}, {smtp_security})."
+    )
 
 
 def pydantic_schema(model: type[BaseModel]) -> dict[str, Any]:
